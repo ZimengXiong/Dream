@@ -11,14 +11,78 @@ import copy
 import traceback
 import threading 
 
+
+def select_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _sanitize_probabilities(probs: torch.Tensor) -> torch.Tensor:
+    """Ensure probs (1D or 2D) contain finite, normalized values."""
+    if not torch.is_floating_point(probs):
+        return probs
+    sanitized = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    sanitized = sanitized.clamp_min(0.0)
+    if sanitized.ndim == 1:
+        total = sanitized.sum()
+        if total <= 0:
+            return torch.full_like(sanitized, 1.0 / sanitized.numel())
+        return sanitized / total
+    total = sanitized.sum(dim=-1, keepdim=True)
+    zero_mask = total <= 0
+    if zero_mask.any():
+        sanitized = sanitized.clone()
+        expanded_mask = zero_mask.expand(-1, sanitized.size(-1))
+        sanitized[expanded_mask] = 1.0
+        total = sanitized.sum(dim=-1, keepdim=True)
+    return sanitized / total
+
+
+def _flatten_probs_if_needed(probs: torch.Tensor):
+    if probs.ndim <= 2:
+        return probs, probs.shape
+    orig_shape = probs.shape
+    flat = probs.contiguous().view(-1, orig_shape[-1])
+    return flat, orig_shape
+
+
+def _reshape_samples_if_needed(samples: torch.Tensor, orig_shape, num_samples: int):
+    if len(orig_shape) <= 2:
+        return samples
+    return samples.view(*orig_shape[:-1], num_samples)
+
+
+_original_multinomial = torch.multinomial
+
+
+def _safe_multinomial(probs, num_samples, replacement=False, *, generator=None, out=None):
+    flat_probs, orig_shape = _flatten_probs_if_needed(probs)
+    normalized = _sanitize_probabilities(flat_probs)
+    samples = _original_multinomial(normalized, num_samples, replacement, generator=generator, out=out)
+    return _reshape_samples_if_needed(samples, orig_shape, num_samples)
+
+
+if not getattr(torch.multinomial, "_dream_safe", False):
+    _safe_multinomial._dream_safe = True  # type: ignore[attr-defined]
+    torch.multinomial = _safe_multinomial  # type: ignore[assignment]
+
 # --- Model Loading ---
 model_path = "Dream-org/Dream-v0-Instruct-7B"
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Using device: {device}")
+device = select_device()
+dtype_by_device = {
+    "cuda": torch.bfloat16,
+    "mps": torch.float16,
+    "cpu": torch.float32,
+}
+dtype = dtype_by_device[device]
+print(f"Using device: {device} (dtype={dtype})")
 
 try:
-    print("Loading model with bfloat16...")
-    dtype = torch.bfloat16
+    print(f"Loading model with {dtype}...")
     model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
     print(f"Model loaded successfully with {dtype}.")
 except Exception as e:
@@ -40,7 +104,7 @@ mask_token_str = "[MASK]"
 
 # --- Move model to device ---
 try:
-    model = model.to(device).eval()
+    model = model.to(device=device, dtype=dtype).eval()
     print(f"Model moved to {device} and set to eval mode.")
 except Exception as e:
     print(f"Fatal Error moving model to device: {e}")
