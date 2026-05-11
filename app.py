@@ -297,10 +297,6 @@ css = """
 """
 
 with gr.Blocks(css=css, theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# Dream Diffusion Model Demo (Text-to-Text)")
-    gr.Markdown("Interact with the **Dream-v0-Instruct-7B** model in a multi-turn conversation and watch the diffusion process in real time.")
-    gr.Markdown("Model link: [Dream-org/Dream-v0-Instruct-7B](https://huggingface.co/Dream-org/Dream-v0-Instruct-7B)")
-
     chat_history_state = gr.State([])
 
     with gr.Row():
